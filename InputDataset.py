@@ -34,7 +34,8 @@ def get_device_order(model_index, sort=True):
 class InputDataSet():
     def __init__(self, num_timeslots=get_total_layers(), input_size=224*224, len_timeslot=0.05):
         # dtype = ([('device_index', int), ('timeslot_index', int)])
-        self.schedule = np.full((get_num_edges(), num_timeslots, 2), fill_value=np.nan) # partition based schedule
+        self.schedule = np.full((get_num_edges(), num_timeslots, 2), fill_value=np.nan) # layer based schedule
+        self.timeslot_schedule = np.full((get_num_edges(), num_timeslots, 2), fill_value=np.nan)
         self.len_timeslot = 0.05 # each timeslot is 50 ms
         self.num_timeslots = len_timeslot 
         self.input_size = input_size
@@ -104,15 +105,15 @@ class InputDataSet():
         # in each device, get the min index with nan (if not being used)
         available_device_timeslot = np.isnan(self.schedule)
         last_timeslot = 0
-        # get the timeslot of the prev. layer
+        # get the timeslot_index of the prev. layer of the same model
         for device_index, device_schedule in enumerate(self.schedule):
             for timeslot, [scheduled_model, scheduled_layer] in enumerate(device_schedule):
-                if scheduled_layer > 0 and scheduled_model == model_index and scheduled_layer == layer_index - 1 and scheduled_layer > last_timeslot: # TODO: add a check for all timeslots that are earlier than the finishing timeslot of the last layer
-                    last_timeslot = scheduled_layer
+                if scheduled_layer > 0 and scheduled_model == model_index and scheduled_layer == layer_index - 1 and timeslot > last_timeslot:
+                    last_timeslot = timeslot
         # mark all timeslots that are earlier as not available                    
         for device_index, device_schedule in enumerate(self.schedule):
             for timeslot, [scheduled_model, scheduled_layer] in enumerate(device_schedule):
-                if scheduled_layer <= last_timeslot:
+                if timeslot <= last_timeslot:
                     available_device_timeslot[device_index][timeslot] = np.array([False, False])
         # create an array with [device_index, earliest_timeslot_index] pair
         etas = []
@@ -252,7 +253,7 @@ class InputDataSet():
                                             ) < device_usage_threshold) \
                                             and (layer_index < len(self.service_info[model_index]['layers']) - 1):
                     eta = self.get_eta_device(model_index, layer_index, device_index)[0][1] #first device on the list, and available timeslot [device_index, timeslot_index]
-                    print('eta: ', eta)
+                    # input()
                     self.partitions[model_index][partition_index].append(layer_index)
                     self.partition_delay[model_index][partition_index] = \
                         self.partition_delay[model_index][partition_index] \
