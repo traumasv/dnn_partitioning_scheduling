@@ -1,4 +1,4 @@
-import sys, copy, math
+import sys, copy, math, pickle
 import config
 import numpy as np
 import torch
@@ -74,7 +74,7 @@ class InputDataSet():
         partition_delay = 0.0
         for layer_index in self.layers_in_partitions[model_index][partition_index]:
             if not np.isnan(layer_index):
-                partition_delay = partition_delay + self.calculate_layer_delay(model_index, layer_index, num_input_partitions=num_input_partitions)
+                partition_delay = partition_delay + self.calculate_layer_delay(model_index, int(layer_index), num_input_partitions=num_input_partitions)
         return partition_delay
     
     def get_finish_time(self):
@@ -167,35 +167,35 @@ class InputDataSet():
         return num_partitions, int(self.service_info[model_index]['layers'][layer_index]['input_data_size'][0] / num_partitions)
 
 ##########################################################################################################################################################################################
-    def get_prev_slot_device_queue(self, model_index, partition_index): 
-        [device_index, slot_index] = self.partition_location[model_index][partition_index]
-        if slot_index == 0:
-            return [None, None]
-        return [int(device_index),int(slot_index-1)]
 
     def get_earliest_slot_in_device(self, device_index):
         return np.argmax(np.isnan(self.device_partition_schedule[device_index]).any(axis=1))
 
-    def get_partition_finish_time(self, model_index, partition_index, num_partitions=1):
+    def get_partition_finish_time(self, model_index, partition_index, device_index, num_partitions=1):
         # Input: self.device_layer_schedule (array of device x timeslot x [model_index, layer_index]), partition_index
         # Output: finishing time for current partition (float)
-        [prev_device_index, prev_slot_index] = self.get_prev_slot_device_queue(model_index, partition_index)
-        if partition_index == 0 and prev_slot_index == None: # if there are no previously assigned partition in the device and this is the first partition of the model
-            return self.partition_delay[model_index][partition_index]
-        [device_i, slot_i] = self.partition_location[model_index][partition_index]
-        [prev_model_index, prev_slot_index] = self.device_partition_schedule[int(device_i)][int(slot_i-1)]
-        if partition_index == 0:
-            return self.partition_finish_time[int(prev_model_index)][int(prev_slot_index)] + self.partition_delay[model_index][partition_index]
-        elif partition_index > 0:
-            return self.partition_finish_time[model_index][partition_index-1] + self.partition_delay[model_index][partition_index]
+        slot_index = self.get_earliest_slot_in_device(device_index)
+        prev_model_index, prev_partition_index = self.device_partition_schedule[device_index][slot_index-1] # get the model and partition that is right before the earliest available slot
+        if slot_index == 0:
+            if partition_index == 0:
+                return self.calculate_partition_delay(model_index, partition_index)
+            elif partition_index > 0:
+                return self.partition_finish_time[model_index][partition_index-1] + self.calculate_partition_delay(model_index, partition_index) 
+        elif slot_index > 0:
+            prev_model_index, prev_partition_index = int(prev_model_index), int(prev_partition_index)
+            if partition_index == 0:
+                return self.partition_finish_time[prev_model_index][prev_partition_index] + self.calculate_partition_delay(model_index, partition_index) 
+            elif partition_index > 0:
+                if self.partition_finish_time[prev_model_index][prev_partition_index] > self.partition_finish_time[model_index][partition_index-1]:
+                    return self.partition_finish_time[prev_model_index][prev_partition_index] + self.calculate_partition_delay(model_index, partition_index) 
+                elif self.partition_finish_time[prev_model_index][prev_partition_index] <= self.partition_finish_time[model_index][partition_index-1]:
+                    return self.partition_finish_time[model_index][partition_index-1] + self.calculate_partition_delay(model_index, partition_index) 
+            
         # TODO: get the last finish time of the input partitions if the num. of partitions is > 1
 
 # TODO: get the first available partition slot with the least amount of waiting time
+
     def calculate_waiting_delay(self, device_index, slot_index, model_index, partition_index):
-        # waiting_delay = self.partition_finish_time[int(prev_model_index)][int(prev_slot_index)] - self.partition_finish_time[model_index][partition_index-1]
-        # if waiting_delay < 0:
-        #     waiting_delay = 0.0
-        # get finish time of the last partition of the same model
         if partition_index == 0:
             return 0.0
         if partition_index > 0:
@@ -209,44 +209,73 @@ class InputDataSet():
     def reschedule_partition(self, model_index, partition_index):
         # Input: model index (int), layer index (int), number of partitions (int)
         # Output: a device and queue index pair (list) to relocate the partition
-        earliest_device, earliest_slot = np.nan, np.nan
-        earliest_start_time = 8.0 # just some random number of seconds that's too long
-        # get the earliest [np.nan, np.nan] slot in self.device_partition_schedule
+        # start with the current assignment as the standard
+        current_device, current_slot = self.partition_location[model_index][partition_index]
+        current_device, current_slot = int(current_device), int(current_slot)
+        earliest_device, earliest_slot = int(current_device), int(current_slot)
+        earliest_finish_time = self.partition_finish_time[model_index][partition_index]
+        print('earliest_finish_time before : ', earliest_finish_time)
+        # search every device and get the earliest slot in the device
         for device_index, _ in enumerate(config.local_device_info):
             device_slot = self.get_earliest_slot_in_device(device_index)
-            if partition_index == 0 and device_slot == 0: # if it's the first in the device, the earliest start time is the finish time of previous partition of the same model
-                start_time = 0
-            if partition_index > 0 and device_slot == 0:
-                start_time = self.partition_finish_time[model_index][partition_index-1]
-            if partition_index > 0 and device_slot > 0:
-                [prev_model_index, prev_partition_index] = self.device_partition_schedule[device_index][device_slot-1]
-                if self.partition_finish_time[int(prev_model_index)][int(prev_partition_index)] > self.partition_finish_time[model_index][partition_index-1]:
-                    start_time = self.partition_finish_time[int(prev_model_index)][int(prev_partition_index)]
-                else:
-                    start_time = self.partition_finish_time[model_index][partition_index-1]
-            if partition_index == 0 and device_slot > 0:
-                [prev_model_index, prev_partition_index] = self.device_partition_schedule[device_index][device_slot-1]
-                start_time = self.partition_finish_time[int(prev_model_index)][int(prev_partition_index)]
-            if start_time < earliest_start_time:
-                earliest_start_time = start_time
-                earliest_device, earliest_slot = device_index, device_slot 
-            else:
-                return 
-        [current_device, current_slot] = self.partition_location[model_index][partition_index]
-        self.device_partition_schedule[int(earliest_device)][int(earliest_slot)] = self.device_partition_schedule[int(current_device)][int(current_slot)]
-        self.device_partition_schedule[int(current_device)][int(current_slot)] = np.array([np.nan, np.nan])
-        self.partition_location[int(current_device)][int(current_slot)] = np.array([int(earliest_device), int(earliest_slot)])
-        self.partition_delay[model_index][partition_index] = self.calculate_partition_delay(model_index, partition_index) # TODO: changes with the change in device
-        self.partition_finish_time[model_index][partition_index] = self.get_partition_finish_time(model_index, partition_index)
+            print('device_index, device_slot: ', device_index, device_slot)
+            new_finish_time = self.get_partition_finish_time(model_index, partition_index, device_slot)
+            print('earliest_finish_time, new_finish_time: ', earliest_finish_time, new_finish_time)
+            if new_finish_time < earliest_finish_time:
+                earliest_device, earliest_slot = device_index, int(device_slot)
+                earliest_finish_time = new_finish_time
+        if earliest_device == current_device and (earliest_slot == current_slot or earliest_slot > current_slot):
+            return
+        self.device_partition_schedule[earliest_device][earliest_slot] = self.device_partition_schedule[current_device][current_slot]
+        self.device_partition_schedule[current_device][current_slot] = np.array([np.nan, np. nan])
+        self.partition_location[model_index][partition_index] = np.array([earliest_device, earliest_slot])
+        # TODO: update partition_delay, partition_finish_time
+        self.partition_delay[model_index][partition_index] = self.calculate_partition_delay(model_index, partition_index)
+        self.partition_finish_time[model_index][partition_index] = earliest_finish_time
+        print('earliest_finish_time after : ', earliest_finish_time)
+        # if earliest_slot == 0 and partition_index == 0:
+        #         earliest_start_time = 0.0
+        # if earliest_slot > 0:
+        #     model_index_before, partition_index_before = self.partition_location[int(earliest_device)][int(earliest_slot)-1]
+        #     earliest_start_time = self.partition_finish_time[int(model_index_before)][int(partition_index_before)]
+        # # get the earliest [np.nan, np.nan] slot in self.device_partition_schedule
+        # for device_index, _ in enumerate(config.local_device_info):
+        #     device_slot = self.get_earliest_slot_in_device(device_index)
+        #     if device_slot == 0: # if there is no slots before, there's no need to reassign
+        #         return
+        #     if partition_index > 0 and device_slot > 0:
+        #         [prev_model_index, prev_partition_index] = self.device_partition_schedule[device_index][device_slot-1]
+        #         if self.partition_finish_time[int(prev_model_index)][int(prev_partition_index)] > self.partition_finish_time[model_index][partition_index-1]:
+        #             start_time = self.partition_finish_time[int(prev_model_index)][int(prev_partition_index)]
+        #         else:
+        #             start_time = self.partition_finish_time[model_index][partition_index-1]
+        #     if partition_index == 0 and device_slot > 0:
+        #         [prev_model_index, prev_partition_index] = self.device_partition_schedule[device_index][device_slot-1]
+        #         start_time = self.partition_finish_time[int(prev_model_index)][int(prev_partition_index)]
+        #     if start_time < earliest_start_time:
+        #         earliest_start_time = start_time
+        #         earliest_device, earliest_slot = device_index, device_slot 
+        # [current_device, current_slot] = self.partition_location[model_index][partition_index]
+        # self.device_partition_schedule[int(earliest_device)][int(earliest_slot)] = self.device_partition_schedule[int(current_device)][int(current_slot)]
+        # self.device_partition_schedule[int(current_device)][int(current_slot)] = np.array([np.nan, np.nan])
+        # self.partition_location[int(current_device)][int(current_slot)] = np.array([int(earliest_device), int(earliest_slot)])
+        # self.partition_delay[model_index][partition_index] = self.calculate_partition_delay(model_index, partition_index) # TODO: changes with the change in device
+        # # TODO: Need a recursive update of the partitions that are after this current partition
+        # input()
+        # self.partition_finish_time[model_index][partition_index] = self.get_partition_finish_time(model_index, partition_index)
+
     
     def reschedule_partitions(self):
         for model_index, partitions in enumerate(self.partition_location):
-            for partition_index, partition in enumerate(self.partition_location[model_index]):
-                self.reschedule_partition(model_index, partition_index)
-                # print('self.device_partition_schedule: ', self.device_partition_schedule)
-                print('self.partition_finish_time: ',self.partition_finish_time)
-                print('self.partition_location: ',self.partition_location)
-                # input()
+            for partition_index, [device_index, device_slot_index] in enumerate(self.partition_location[model_index]):
+                if not np.isnan(device_index):
+                    print('model_index: ',model_index)
+                    print('partition_index: ',partition_index)
+                    self.reschedule_partition(model_index, partition_index)
+                    print('self.partition_location: ',self.partition_location)
+                    print('self.device_partition_schedule: ', self.device_partition_schedule)
+                    print('self.partition_finish_time: ',self.partition_finish_time)
+                    input()
         return self.get_finish_time()
                 
 ##########################################################################################################################################################################################
@@ -320,7 +349,6 @@ class InputDataSet():
                     # input()
                 
         return self.get_finish_time()
-
 ds = InputDataSet()
 print('Finish time before re-scheduling:',ds.create_init_model_partition())
 input()
