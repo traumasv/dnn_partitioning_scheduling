@@ -39,7 +39,7 @@ class InputDataSet():
         # self.device_partition_schedule = [[] for i in range(self.num_devices)] # partition based schedule (num. of device x num. of device)
         self.layers_in_partitions = np.full((self.num_services, max_num_partition_slots, max_num_layer_in_partition), fill_value=np.nan)
         self.partition_delay = np.full((self.num_services, max_num_partition_slots), fill_value=0.0, dtype=float) # comp. + trans. delay
-        self.partition_start_time = np.full((self.num_services, max_num_partition_slots), fill_value=0.0, dtype=float)
+        self.partition_start_time = np.full((self.num_services, max_num_partition_slots), fill_value=np.nan, dtype=float)
         self.partition_finish_time = np.full((self.num_services, max_num_partition_slots), fill_value=np.nan, dtype=float) # the finish time of the prev. partition and comp. + trans. delay
         self.device_partition_schedule = np.full((self.num_devices, max_num_partition_slots, 2), fill_value=np.nan) # partition based schedule (num. of device x num. of device)
         self.partition_location = np.full((self.num_services, max_num_partition_slots, 2), fill_value=np.nan) # location of each partition [device_index, slot]
@@ -63,15 +63,16 @@ class InputDataSet():
     def calculate_layer_delay(self, model_index, layer_index, transmission_rate=10*(10**6), num_input_partitions=1): # Model index: 0 - AlexNet, 1 - GoogLeNet, 2 - ResNet-50 
         # Input: model index (int), layer index (int), list of device index/indices [int,..], number of partitions (int)
         # Output: total delay (float)
-        devices = self.get_n_devices(model_index=model_index, layer_index=layer_index, num_devices=num_input_partitions) # TODO this should change as different partitions are assigned on different devices
+        devices = self.get_n_devices(model_index=model_index, layer_index=layer_index, num_devices=num_input_partitions) # TODO: this should change as different partitions are assigned on different devices
         weakest_device_index = devices[-1]['device_index']
         comp_delay = (self.service_info[model_index]['layers'][layer_index]['workload_size'] * config.local_device_info[weakest_device_index]['computing_intensity'][model_index])\
                     / (config.local_device_info[weakest_device_index]['computing_frequency'] * num_input_partitions)
-        trans_delay = self.service_info[model_index]['layers'][layer_index]['input_data_size'][0] / (transmission_rate * num_input_partitions) # input data size is a single elem. arr.
-        return comp_delay + trans_delay
+        # trans_delay = self.service_info[model_index]['layers'][layer_index]['input_data_size'][0] / (transmission_rate * num_input_partitions) # TODO: take this off, add it to calculate_partition_delay
+        return comp_delay
     
     def calculate_partition_delay(self, model_index, partition_index, num_input_partitions = 1):
         partition_delay = 0.0
+        # TODO: add transmission delay of the last layer of the partition depending on whether the prev. and next partition is in the same device
         for layer_index in self.layers_in_partitions[model_index][partition_index]:
             if not np.isnan(layer_index):
                 partition_delay = partition_delay + self.calculate_layer_delay(model_index, int(layer_index), num_input_partitions=num_input_partitions)
@@ -88,25 +89,25 @@ class InputDataSet():
         # Input: self.device_layer_schedule
         # Output: an array of all devices [device_index, earliest_timeslot_index] pair
         # in each device, get the min index with nan (if not being used)
-        available_device_timeslot = np.isnan(self.device_layer_schedule)
-        last_timeslot = 0
-        # get the timeslot_index of the prev. layer of the same model
+        available_device_slot = np.isnan(self.device_layer_schedule)
+        last_slot = 0
+        # get the slot_index of the prev. layer of the same model
         for device_index, device_schedule in enumerate(self.device_layer_schedule):
-            for timeslot, [scheduled_model, scheduled_layer] in enumerate(device_schedule):
-                if scheduled_layer > 0 and scheduled_model == model_index and scheduled_layer == layer_index - 1 and timeslot > last_timeslot:
-                    last_timeslot = timeslot
-        # mark all timeslots that are earlier as not available                    
+            for slot, [scheduled_model, scheduled_layer] in enumerate(device_schedule):
+                if scheduled_layer > 0 and scheduled_model == model_index and scheduled_layer == layer_index - 1 and slot > last_slot:
+                    last_slot = slot
+        # mark all slots that are earlier as not available                    
         for device_index, device_schedule in enumerate(self.device_layer_schedule):
-            for timeslot, [scheduled_model, scheduled_layer] in enumerate(device_schedule):
-                if timeslot <= last_timeslot:
-                    available_device_timeslot[device_index][timeslot] = np.array([False, False])
-        # create an array with [device_index, earliest_timeslot_index] pair
+            for slot, [scheduled_model, scheduled_layer] in enumerate(device_schedule):
+                if slot <= last_slot:
+                    available_device_slot[device_index][slot] = np.array([False, False])
+        # create an array with [device_index, earliest_slot_index] pair
         etas = []
-        # dtype = ([('device_index', int), ('timeslot_index', int)])
-        for i, x in enumerate(available_device_timeslot):
-            for timeslot, pair in enumerate(x):
+        # dtype = ([('device_index', int), ('slot_index', int)])
+        for i, x in enumerate(available_device_slot):
+            for slot, pair in enumerate(x):
                 if pair.any(): # if there are any nan that returned False
-                    etas.append(np.array([i, timeslot]))
+                    etas.append(np.array([i, slot]))
                     break
         etas = np.array(etas)
         # sort the device index by the ETA order
@@ -117,11 +118,11 @@ class InputDataSet():
         # Input: model index (int), layer index (int), device index (int)
         # Output: get etas (array of [device_index, layer_index]) with the correct device index
         etas = self.get_etas_layer(model_index=model_index, layer_index=layer_index)
-        device_eta = np.array([[device, timeslot] for [device, timeslot] in etas if device == device_index])
+        device_eta = np.array([[device, slot] for [device, slot] in etas if device == device_index])
         return device_eta
 
     def get_n_devices(self, model_index, layer_index, num_devices=len(config.local_device_info)):
-        # Input: number of devices (int), number of timeslots (int)
+        # Input: number of devices (int)
         # Output: array of (device index, compute capacity, earliest time available) (int, int, int)
         device_order = get_device_order(model_index=model_index, sort=False)
         etas = self.get_etas_layer(model_index=model_index, layer_index=layer_index)
@@ -141,30 +142,30 @@ class InputDataSet():
                 * ((self.service_info[model_index]['layers'][layer_index]['input_width'] / num_partitions) )) ) \
                 / ((self.service_info[model_index]['layers'][layer_index]['input_height'] / num_partitions) * (self.service_info[model_index]['layers'][layer_index]['input_width'] / num_partitions))
 
-    def get_num_input_partitions(self, model_index, layer_index, padding_threshold=0.50): # TODO: turn this from per layer -> per partition
+    def get_num_input_partitions(self, model_index, partition_index, padding_threshold=0.50): # TODO: turn this from per layer -> per partition
         # Input: input_size (int)
         # Output: num_partitions (int), input_partition_size (int)
         temp = 1
-        num_partitions = 1
+        num_input_partitions = 1
         t_num_partitions = 10000000000
-        partition_size = int(self.service_info[model_index]['layers'][layer_index]['input_data_size'][0] / temp)
-        t_temp = self.calculate_layer_delay(
+        input_partition_size = int(self.service_info[model_index]['layers'][partition_index]['input_data_size'][0] / temp)
+        t_temp = self.calculate_partition_delay(
                                             model_index=model_index, 
-                                            layer_index=layer_index, 
+                                            partition_index=partition_index, 
                                             num_input_partitions=temp
                                             )
         while t_num_partitions > t_temp \
-                and self.calculate_padding_proportion(model_index=model_index, layer_index=layer_index, num_partitions=temp) < padding_threshold \
+                and self.calculate_padding_proportion(model_index=model_index, partition_index=partition_index, num_partitions=temp) < padding_threshold \
                 and num_partitions < get_num_edges():
             num_partitions = temp
             t_num_partitions = t_temp
             temp = temp+1
             t_temp = self.calculate_layer_delay(
                                                 model_index=model_index,
-                                                layer_index=layer_index,
+                                                partition_index=partition_index,
                                                 num_input_partitions=temp
                                                 )
-        return num_partitions, int(self.service_info[model_index]['layers'][layer_index]['input_data_size'][0] / num_partitions)
+        return num_partitions, int(self.service_info[model_index]['layers'][partition_index]['input_data_size'][0] / num_partitions)
 
 ##########################################################################################################################################################################################
 
@@ -184,13 +185,19 @@ class InputDataSet():
         # Output: slot index with the first np.nan (int)
         return np.argmax(np.isnan(self.device_partition_schedule[device_index]).any(axis=1))
 
+    def get_crevice_slots(self, model_index, partition_index):
+        # TODO: get time gaps between partitions and reschedule
+        self.partition_start_time[model_index][partition_index]
+        return
+
     def get_partition_finish_time(self, model_index, partition_index, device_index, num_partitions=1):
         # Input: self.device_layer_schedule (array of device x timeslot x [model_index, layer_index]), partition_index
         # Output: finishing time for current partition (float)
         slot_index = self.get_earliest_slot_in_device(device_index)
         print('slot_index: ', slot_index)
+        self.partition_start_time[model_index][partition_index]
         prev_model_index, prev_partition_index = self.device_partition_schedule[device_index][slot_index-1] # get the model and partition that is right before the earliest available slot
-        if slot_index == 0: # FIXME: the slot placement should be based on the start time
+        if slot_index == 0:
             if partition_index == 0:
                 return self.calculate_partition_delay(model_index, partition_index)
             elif partition_index > 0:
@@ -214,18 +221,16 @@ class InputDataSet():
         current_device, current_slot = int(current_device), int(current_slot)
         earliest_device, earliest_slot = int(current_device), int(current_slot)
         earliest_finish_time = self.partition_finish_time[model_index][partition_index]
-        print('earliest_finish_time before : ', earliest_finish_time)
-        # search every device and get the earliest slot in the device
+        # search every device and get the earliest slot in each device
         for device_index, _ in enumerate(config.local_device_info):
             device_slot = self.get_earliest_slot_in_device(device_index)
-            print('device_index, device_slot: ', device_index, device_slot)
             new_finish_time = self.get_partition_finish_time(model_index, partition_index, device_index)
-            print('earliest_finish_time, new_finish_time: ', earliest_finish_time, new_finish_time)
             if new_finish_time < earliest_finish_time:
                 earliest_device, earliest_slot = device_index, int(device_slot)
                 earliest_finish_time = new_finish_time
         if earliest_device == current_device and earliest_slot >= current_slot:
             return
+        # TODO: update the start time
         self.device_partition_schedule[earliest_device][earliest_slot] = self.device_partition_schedule[current_device][current_slot]
         self.device_partition_schedule[current_device][current_slot] = np.array([np.nan, np. nan])
         self.partition_location[model_index][partition_index] = np.array([earliest_device, earliest_slot])
@@ -257,10 +262,6 @@ class InputDataSet():
             partition_start_time = 0.0
             for device_index, device_schedule in enumerate(self.device_layer_schedule):
                 layer_index_in_partition = 0
-                self.partition_start_time[model_index][partition_index] = partition_start_time # TODO: finish adding partition start time
-                # begin a partition
-                # self.layers_in_partitions[model_index].append([])
-                # self.partition_delay[model_index].append(0.0)
                 # if self.service_info[model_index]['layers'][layer_index]['layer_type'] == 'fc':
                 #     optimal_num_partitions = 1
                 # else:
@@ -309,12 +310,27 @@ class InputDataSet():
                     self.device_layer_schedule[device_index][eta] = [model_index, layer_index]
                     layer_index += 1
                 if not np.isnan(self.layers_in_partitions[model_index][partition_index]).all(): # check if it's a partition with layers inside
+                    # TODO: finish input partitioning for the created layer group partitions
                     partition_index_in_device = self.get_earliest_slot_in_device(device_index)
                     self.partition_location[model_index][partition_index] = [device_index, partition_index_in_device]
                     self.partition_finish_time[model_index][partition_index] = self.get_partition_finish_time(model_index, partition_index, device_index) # get_partition_finish_time() only works for when initially creating the partition
                     self.device_partition_schedule[device_index][partition_index_in_device] = [model_index, partition_index]
+                    # set start time
+                    if partition_index_in_device == 0:
+                        if device_index == 0:
+                            self.partition_start_time[model_index][partition_index] = 0.0
+                        else:
+                            prev_device_earliest_slot = self.get_earliest_slot_in_device(device_index-1) - 1
+                            prev_model, prev_partition = self.device_partition_schedule[device_index-1][prev_device_earliest_slot]
+                            prev_model, prev_partition = int(prev_model), int(prev_partition)
+                            self.partition_start_time[model_index][partition_index] = self.partition_finish_time[prev_model][prev_partition]
+                    else:
+                        prev_model, prev_partition = self.device_partition_schedule[device_index][partition_index_in_device-1]
+                        prev_model, prev_partition = int(prev_model), int(prev_partition)
+                        self.partition_start_time[model_index][partition_index] = self.partition_finish_time[prev_model][prev_partition]
                     partition_index += 1
                     print('self.partition_delay: ', self.partition_delay)
+                    print('self.partition_start_time: ',self.partition_start_time)
                     print('self.partition_finish_time: ',self.partition_finish_time)
                     print('self.partition_location: ', self.partition_location)
                     # input() 
